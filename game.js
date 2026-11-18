@@ -3680,13 +3680,15 @@ const state = {
   relaxSpec: null,
   boardGeneration: 0,
   advanceTimer: null,
-  packTimer: null,
+  packFxTimers: [],
+  packFxCounter: 0,
+  victoryTimer: null,
   catTimer: null,
   suppressNextClickUntil: 0,
   shelves: [],
   undoStack: [],
   selectedItem: null, // { shelfId, slotIdx, item }
-  packingState: null, // { shelfId, itemType }
+  packingEffects: [], // { id, shelfId, itemType, startedAt }
   advancedShelfIds: [],
   highlightedUids: [],
   hintTargetShelfId: null,
@@ -3717,11 +3719,19 @@ function clearPendingAdvanceTimer() {
   }
 }
 
-function clearPendingPackTimer() {
-  if (state.packTimer !== null) {
-    clearTimeout(state.packTimer);
-    state.packTimer = null;
+function clearPendingVictoryTimer() {
+  if (state.victoryTimer !== null) {
+    clearTimeout(state.victoryTimer);
+    state.victoryTimer = null;
   }
+}
+
+function clearPendingPackEffects() {
+  while (state.packFxTimers.length > 0) {
+    clearTimeout(state.packFxTimers.pop());
+  }
+  state.packingEffects = [];
+  document.querySelectorAll('[data-pack-fx-id]').forEach((el) => el.remove());
 }
 
 function scheduleAdvanceClear(moveGen) {
@@ -3730,10 +3740,23 @@ function scheduleAdvanceClear(moveGen) {
     state.advanceTimer = null;
     if (state.boardGeneration !== moveGen) return;
     state.advancedShelfIds = [];
-    if (!state.isAnimating) {
-      renderApp();
+    document.querySelectorAll('.anim-slide-forward').forEach((el) => {
+      el.classList.remove('anim-slide-forward');
+    });
+  }, 240);
+}
+
+function schedulePackEffectClear(effectId, moveGen) {
+  const timerId = setTimeout(() => {
+    state.packFxTimers = state.packFxTimers.filter((t) => t !== timerId);
+    if (state.boardGeneration !== moveGen) return;
+    state.packingEffects = state.packingEffects.filter((ef) => ef.id !== effectId);
+    document.querySelectorAll(`[data-pack-fx-id="${effectId}"]`).forEach((el) => el.remove());
+    if (state.packingEffects.length === 0 && state.catTimer === null) {
+      state.catIsHappy = false;
     }
   }, 380);
+  state.packFxTimers.push(timerId);
 }
 
 soundEngine.sfxEnabled = state.save.sfxEnabled;
@@ -3787,7 +3810,8 @@ function applyThemeCssVariables() {
 function startLevelBoard(spec, rotateIfEnabled = false, initialHintMessage = null) {
   state.boardGeneration += 1;
   clearPendingAdvanceTimer();
-  clearPendingPackTimer();
+  clearPendingVictoryTimer();
+  clearPendingPackEffects();
   clearSavedBoard();
   if (
     rotateIfEnabled &&
@@ -3802,7 +3826,6 @@ function startLevelBoard(spec, rotateIfEnabled = false, initialHintMessage = nul
   state.shelves = generateLevelBoard(spec);
   state.undoStack = [];
   state.selectedItem = null;
-  state.packingState = null;
   state.advancedShelfIds = [];
   state.highlightedUids = [];
   state.hintTargetShelfId = null;
@@ -3907,46 +3930,57 @@ function performMove(fromShelfId, fromSlotIdx, toShelfId, toSlotIdx) {
     const theme = getThemeById(state.save.activeThemeId);
     const matchedItemName = theme.items[matchedType % theme.items.length].name;
     recordPackedTrio(matchedType);
-    state.isAnimating = true;
-    state.packingState = { shelfId: toShelfId, itemType: matchedType };
+
+    // Clear matched shelf immediately so the player can start their next move without waiting
+    const targetAfter = state.shelves.find((s) => s.id === toShelfId);
+    if (targetAfter) {
+      targetAfter.layers[0] = [null, null, null];
+    }
+    const { updatedShelves: finalBoard, advancedShelfIds: targetAdv } =
+      normalizeShelfLayers(state.shelves);
+    state.shelves = finalBoard;
+    const combinedAdv = Array.from(new Set([...sourceAdv, ...targetAdv]));
+    if (combinedAdv.length > 0) {
+      if (targetAdv.length > 0 && sourceAdv.length === 0) {
+        soundEngine.playSlideForward();
+      }
+      state.advancedShelfIds = combinedAdv;
+      scheduleAdvanceClear(moveGen);
+    }
+
+    const packFx = {
+      id: ++state.packFxCounter,
+      shelfId: toShelfId,
+      itemType: matchedType,
+      startedAt: Date.now(),
+    };
+    state.packingEffects = [
+      ...state.packingEffects.filter((ef) => ef.shelfId !== toShelfId),
+      packFx,
+    ];
+    state.isAnimating = false;
     state.catIsHappy = true;
     state.catSpeech = `Purr-fect! Packed 3 ${matchedItemName}s into a ${theme.containerName}!`;
     soundEngine.playPackMatch();
     persistSave();
+
+    const remainingAfterPack = countRemainingItems(state.shelves);
+    if (remainingAfterPack > 0) {
+      persistBoardState();
+    } else {
+      clearSavedBoard();
+    }
     renderApp();
+    schedulePackEffectClear(packFx.id, moveGen);
 
-    clearPendingPackTimer();
-    state.packTimer = setTimeout(() => {
-      state.packTimer = null;
-      if (state.boardGeneration !== moveGen) return;
-      const targetAfter = state.shelves.find((s) => s.id === toShelfId);
-      if (targetAfter) {
-        targetAfter.layers[0] = [null, null, null];
-      }
-      const { updatedShelves: finalBoard, advancedShelfIds: targetAdv } =
-        normalizeShelfLayers(state.shelves);
-      state.shelves = finalBoard;
-      state.packingState = null;
-      state.isAnimating = false;
-      state.catIsHappy = false;
-
-      if (targetAdv.length > 0) {
-        soundEngine.playSlideForward();
-        state.advancedShelfIds = Array.from(
-          new Set([...state.advancedShelfIds, ...targetAdv])
-        );
-        scheduleAdvanceClear(moveGen);
-      } else {
-        clearPendingAdvanceTimer();
-        state.advancedShelfIds = [];
-      }
-
-      if (countRemainingItems(state.shelves) > 0) {
-        persistBoardState();
-      }
-      renderApp();
-      checkAndTriggerVictory();
-    }, 580);
+    if (remainingAfterPack === 0) {
+      clearPendingVictoryTimer();
+      state.victoryTimer = setTimeout(() => {
+        state.victoryTimer = null;
+        if (state.boardGeneration !== moveGen) return;
+        checkAndTriggerVictory();
+      }, 260);
+    }
   } else {
     persistBoardState();
     renderApp();
@@ -3988,7 +4022,9 @@ function renderApp() {
       const frontRow = shelf.layers[0];
       const secondRow = shelf.layers.length > 1 ? shelf.layers[1] : null;
       const backRowsRemaining = Math.max(0, shelf.layers.length - 1);
-      const isPacking = state.packingState && state.packingState.shelfId === shelf.id;
+      const packFx = state.packingEffects.find(
+        (ef) => ef.shelfId === shelf.id && Date.now() - ef.startedAt < 400
+      );
       const isHintTarget = state.hintTargetShelfId === shelf.id;
       const hasOpenSlot = frontRow.some((s) => s === null);
       const canReceive =
@@ -4023,7 +4059,7 @@ function renderApp() {
           const frontHtml = frontItem
             ? `<div class="front-item-wrap ${isSelected ? 'selected' : ''} ${
                 isSpotlight ? 'spotlight' : ''
-              } ${isPacking ? `anim-pack-${slotIdx}` : isAdvanced ? 'anim-slide-forward' : ''}"
+              } ${isAdvanced ? 'anim-slide-forward' : ''}"
                 data-drag-shelf="${shelf.id}"
                 data-drag-slot="${slotIdx}"
               >${renderGroceryItemSvg(
@@ -4042,15 +4078,33 @@ function renderApp() {
         })
         .join('');
 
-      const packingOverlayHtml = isPacking
-        ? `<div class="packing-basket-back" aria-hidden="true">
+      let packingOverlayHtml = '';
+      if (packFx) {
+        const elapsedMs = Math.max(0, Date.now() - packFx.startedAt);
+        const packedItemDef = theme.items[packFx.itemType % theme.items.length];
+        const packedItemSvg = renderGroceryItemSvg(packedItemDef, false);
+        const flyingSlotsHtml = [0, 1, 2]
+          .map(
+            (slotIdx) => `
+            <div class="packing-slot">
+              <div class="front-item-wrap anim-pack-${slotIdx}" style="animation-delay:${slotIdx * 30 - elapsedMs}ms;">
+                ${packedItemSvg}
+              </div>
+            </div>`
+          )
+          .join('');
+        packingOverlayHtml = `
+          <div class="packing-basket-back" data-pack-fx-id="${packFx.id}" style="animation-delay:-${elapsedMs}ms;" aria-hidden="true">
             <svg viewBox="0 0 120 78" width="112" height="76">
               <path d="M 24 34 C 24 5, 96 5, 96 34" fill="none" stroke="#92400e" stroke-width="6.5" stroke-linecap="round" />
               <path d="M 24 34 C 24 5, 96 5, 96 34" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="6 4" />
               <ellipse cx="60" cy="35" rx="44" ry="11" fill="#451a03" stroke="#b45309" stroke-width="3" />
             </svg>
           </div>
-          <div class="packing-basket-front" aria-hidden="true">
+          <div class="packing-items-overlay" data-pack-fx-id="${packFx.id}" aria-hidden="true">
+            ${flyingSlotsHtml}
+          </div>
+          <div class="packing-basket-front" data-pack-fx-id="${packFx.id}" style="animation-delay:-${elapsedMs}ms;" aria-hidden="true">
             <svg viewBox="0 0 120 78" width="112" height="76">
               <path d="M 18 35 Q 34 45 48 37 Q 62 45 76 37 Q 90 45 102 35 L 99 45 Q 60 52 21 45 Z" fill="var(--container-secondary)" />
               <path d="M 16 35 Q 60 44 104 35 L 95 70 Q 60 76 25 70 Z" fill="#d97706" stroke="#78350f" stroke-width="2.5" stroke-linejoin="round" />
@@ -4061,8 +4115,8 @@ function renderApp() {
               <path d="M 16 33 Q 60 43 104 33" fill="none" stroke="#fde68a" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="5 5" />
             </svg>
           </div>
-          <div class="packing-sparkle-tag">✨ Packed Trio!</div>`
-        : '';
+          <div class="packing-sparkle-tag" data-pack-fx-id="${packFx.id}" style="animation-delay:-${elapsedMs}ms;">✨ Packed Trio!</div>`;
+      }
 
       return `
         <div class="shelf-unit ${canReceive ? 'can-receive' : ''} ${
@@ -5201,11 +5255,12 @@ function bindAppEvents() {
       state.toyIsPlaying = false;
       state.catIsHappy = false;
       const focusedTag = document.activeElement && document.activeElement.tagName;
-      if (state.isAnimating || state.activeModal || focusedTag === 'INPUT' || focusedTag === 'TEXTAREA') {
+      if (state.isAnimating || state.drag || state.activeModal || focusedTag === 'INPUT' || focusedTag === 'TEXTAREA') {
         const petBtn = document.getElementById('btn-pet-cat');
         const toyBtn = document.getElementById('btn-play-toy');
         if (petBtn) petBtn.classList.remove('pet-bounce');
         if (toyBtn) toyBtn.classList.remove('toy-bounce');
+        document.querySelectorAll('.cat-heart-float').forEach((el) => el.remove());
         return;
       }
       renderApp();
@@ -5436,6 +5491,8 @@ function bindAppEvents() {
   const handleUndo = () => {
     if (state.undoStack.length === 0 || state.isAnimating) return;
     clearPendingAdvanceTimer();
+    clearPendingVictoryTimer();
+    clearPendingPackEffects();
     state.advancedShelfIds = [];
     state.shelves = state.undoStack.pop();
     state.selectedItem = null;
@@ -5465,6 +5522,8 @@ function bindAppEvents() {
     const res = executeAutoPackTrio(state.shelves);
     if (!res) return;
     clearPendingAdvanceTimer();
+    clearPendingVictoryTimer();
+    clearPendingPackEffects();
     state.advancedShelfIds = [];
     if (res.packedItemType !== null) {
       recordPackedTrio(res.packedItemType);
@@ -5487,6 +5546,8 @@ function bindAppEvents() {
   const handleShuffle = () => {
     if (state.save.points < HINT_COSTS.SHUFFLE || state.isAnimating) return;
     clearPendingAdvanceTimer();
+    clearPendingVictoryTimer();
+    clearPendingPackEffects();
     state.advancedShelfIds = [];
     soundEngine.playSparkle();
     state.undoStack.push(cloneShelves(state.shelves));

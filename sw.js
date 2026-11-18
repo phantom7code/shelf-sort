@@ -1,4 +1,4 @@
-const CACHE_NAME = 'cozy-market-sort-v21';
+const CACHE_NAME = 'cozy-market-sort-v22';
 const ASSETS = [
   './',
   './index.html',
